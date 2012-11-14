@@ -8,21 +8,104 @@
 #include <windows.h>
 #include <process.h>
 
+void DisplayError(char *pszAPI)
+{
+	LPVOID lpvMessageBuffer;
+	TCHAR szPrintBuffer[512];
+	DWORD nCharsWritten;
+
+	FormatMessage(
+		FORMAT_MESSAGE_ALLOCATE_BUFFER|FORMAT_MESSAGE_FROM_SYSTEM,
+		NULL, GetLastError(),
+		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+		(LPTSTR)&lpvMessageBuffer, 0, NULL);
+
+	_stprintf(szPrintBuffer,
+		_T("ERROR: API    = %s.\n   error code = %d.\n   message    = %s.\n"),
+		pszAPI, GetLastError(), (char *)lpvMessageBuffer);
+
+	WriteConsole(GetStdHandle(STD_OUTPUT_HANDLE),szPrintBuffer,
+		lstrlen(szPrintBuffer),&nCharsWritten,NULL);
+
+	LocalFree(lpvMessageBuffer);
+	ExitProcess(GetLastError());
+}
+
+void Display(char* fmt,...) {
+  const size_t size = 1024;
+  char buf[size];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, size, fmt, ap);
+  va_end(ap);
+
+	DWORD nCharsWritten;
+	WriteConsole(GetStdHandle(STD_OUTPUT_HANDLE), buf, strlen(buf),&nCharsWritten,NULL);
+}
+
+
+
+struct PairOfHandles {
+  HANDLE hFrom;
+  HANDLE hTo;
+  HANDLE hToClose;
+  
+  PairOfHandles(HANDLE _hFrom, HANDLE _hTo, HANDLE _hToClose) : hFrom(_hFrom), hTo(_hTo), hToClose(_hToClose) {}
+};
+
+VOID CALLBACK redirectCallback(PTP_CALLBACK_INSTANCE Instance, PVOID Parameter, PTP_WORK Work)
+{
+  PairOfHandles* ppoh = (PairOfHandles*)Parameter;
+  CHAR lpBuffer[256];
+  DWORD nBytesRead;
+  DWORD nBytesWritten;
+  printf("%d(%d) redirectCallback %d -> %d, planning on closing %d\n", GetCurrentProcessId(), GetCurrentThreadId(), ppoh->hFrom, ppoh->hTo, ppoh->hToClose);
+
+  while(TRUE)
+  {
+    if (!ReadFile(ppoh->hFrom, lpBuffer, sizeof(lpBuffer), &nBytesRead, NULL) || !nBytesRead)
+    {
+      DWORD dwErr = GetLastError();
+      if (dwErr == ERROR_BROKEN_PIPE || dwErr == ERROR_INVALID_HANDLE)
+        break; // pipe done - normal exit path.
+      else
+        DisplayError("ReadFile"); // Something bad happened.
+    }
+    Display("%d(%d)\t\tread %d bytes from %d\n", GetCurrentProcessId(), GetCurrentThreadId(), nBytesRead, ppoh->hFrom);
+    if (!WriteFile(ppoh->hTo, lpBuffer, nBytesRead, &nBytesWritten, NULL))
+    {
+      if (GetLastError() == ERROR_BROKEN_PIPE)
+        break; // pipe done - normal exit path.
+      else
+        DisplayError("WriteFile"); // Something bad happened.
+    }
+    Display("%d(%d)\t\twrote %d bytes to %d\n", GetCurrentProcessId(), GetCurrentThreadId(), nBytesWritten, ppoh->hTo);
+  }
+  if (ppoh->hToClose != INVALID_HANDLE_VALUE) {
+    printf("%d(%d)\t\tend of redirect - closing %d\n", GetCurrentProcessId(), GetCurrentThreadId(), ppoh->hToClose);
+    CloseHandle(ppoh->hToClose);
+  }
+  delete ppoh;
+}
+
 struct WaiterParams {
   PROCESS_INFORMATION process_info;
   HANDLE event;
+  HANDLE hChildReadInput;
   int* pRC;
 
-  WaiterParams(PROCESS_INFORMATION pi, HANDLE e, int* _pRC): process_info(pi), event(e), pRC(_pRC) {}
+  WaiterParams(PROCESS_INFORMATION pi, HANDLE e, HANDLE _hChildReadInput, int* _pRC): process_info(pi), event(e), hChildReadInput(_hChildReadInput), pRC(_pRC) {}
 };
 
 VOID CALLBACK callback(PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_WAIT wait, TP_WAIT_RESULT waitResult) {
-    WaiterParams* wp = (WaiterParams*)context;
-    SetEvent(wp->event);
-    delete wp;
+  WaiterParams* wp = (WaiterParams*)context;
+  printf("%d(%d) callback: closing %d\n", GetCurrentProcessId(), GetCurrentThreadId(), wp->hChildReadInput);
+  CloseHandle(wp->hChildReadInput);
+  SetEvent(wp->event);
+  delete wp;
 }
 
-int _tmain(int argc, _TCHAR* argv[])
+int _tmain1(int argc, _TCHAR* argv[])
 {
   int depth;
   if (argc < 2) {
@@ -31,7 +114,15 @@ int _tmain(int argc, _TCHAR* argv[])
   }
   depth = _ttoi(argv[1]);
   printf("%2d", depth);
-  if (depth == 0) { return 1; }
+  if (depth == 0) {
+    printf("%d(%d)************\n", GetCurrentProcessId(), GetCurrentThreadId());
+    //printf("***********************************\n%d(%d) Closing stdin=%d stdout=%d stderr=%d\n", GetCurrentProcessId(), GetCurrentThreadId(), GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE));
+    //if (!CloseHandle(GetStdHandle(STD_INPUT_HANDLE))) { DisplayError("CloseHandle"); }
+    //if (!CloseHandle(GetStdHandle(STD_OUTPUT_HANDLE))) { DisplayError("CloseHandle"); }
+    //if (!CloseHandle(GetStdHandle(STD_ERROR_HANDLE))) { DisplayError("CloseHandle"); }
+    //printf("***********************************\n%d(%d) Closed stdin=%d stdout=%d stderr=%d\n", GetCurrentProcessId(), GetCurrentThreadId(), GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE));
+    return 1;
+  }
 
   int multiply = 1;
   if (argc > 2) {
@@ -67,19 +158,54 @@ int _tmain(int argc, _TCHAR* argv[])
     PROCESS_INFORMATION pi;
     HANDLE hEvent;
     HANDLE hWait;
+    HANDLE hOutputRead;
+    HANDLE hErrorRead;
+    HANDLE hInputWrite;
+
     int rc;
-    ProcSetup(PROCESS_INFORMATION _pi, HANDLE _hEvent, HANDLE _hWait): pi(_pi), hEvent(_hEvent), hWait(_hWait) {}
+    ProcSetup(PROCESS_INFORMATION _pi, HANDLE _hEvent, HANDLE _hWait,
+        HANDLE _hOutputRead, HANDLE _hErrorRead, HANDLE _hInputWrite)
+        : pi(_pi), hEvent(_hEvent), hWait(_hWait), hOutputRead(_hOutputRead), hErrorRead(_hErrorRead), hInputWrite(_hInputWrite) {}
   };
 
   ProcSetup* pss = (ProcSetup*)calloc(multiply, sizeof(ProcSetup));
 
   for (int i = 0; i < multiply; i++) {
-    STARTUPINFO startup_info;
+	  HANDLE hOutputRead, hOutputWrite;
+	  HANDLE hErrorRead, hErrorWrite;
+	  HANDLE hInputRead, hInputWrite;
+	  SECURITY_ATTRIBUTES sa;
+
+	  // Set up the security attributes struct.
+	  sa.nLength= sizeof(SECURITY_ATTRIBUTES);
+	  sa.lpSecurityDescriptor = NULL;
+	  sa.bInheritHandle = TRUE;
+
+	  if (!CreatePipe(&hOutputRead, &hOutputWrite, &sa, 0)) DisplayError("CreatePipe");
+    printf("%d(%d) Created output pipe: r:%d* <-> w:%d\n", GetCurrentProcessId(), GetCurrentThreadId(), hOutputRead, hOutputWrite);
+    if (!SetHandleInformation(hOutputRead, HANDLE_FLAG_INHERIT, 0)) DisplayError("SetHandleInformation");
+
+    if (!CreatePipe(&hErrorRead, &hErrorWrite, &sa, 0)) DisplayError("CreatePipe");
+    printf("%d(%d) Created error pipe: r:%d* <-> w:%d\n", GetCurrentProcessId(), GetCurrentThreadId(), hErrorRead, hErrorWrite);
+    if (!SetHandleInformation(hErrorRead, HANDLE_FLAG_INHERIT, 0)) DisplayError("SetHandleInformation");
+
+	  if (!CreatePipe(&hInputRead, &hInputWrite, &sa, 0)) DisplayError("CreatePipe");
+    printf("%d(%d) Created input pipe: r:%d <-> w*:%d\n", GetCurrentProcessId(), GetCurrentThreadId(), hInputRead, hInputWrite);
+    if (!SetHandleInformation(hInputWrite, HANDLE_FLAG_INHERIT, 0)) DisplayError("SetHandleInformation");
+
+    HANDLE hChildStdInput;
+
+  	STARTUPINFO startup_info;
     ZeroMemory(&startup_info, sizeof(startup_info));
     startup_info.cb = sizeof(startup_info);
-    startup_info.hStdInput = GetStdHandle(STD_INPUT_HANDLE); //stdin_handles[kReadHandle];
-    startup_info.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE); //stdout_handles[kWriteHandle];
-    startup_info.hStdError = GetStdHandle(STD_ERROR_HANDLE); //stderr_handles[kWriteHandle];
+    //startup_info.hStdInput = GetStdHandle(STD_INPUT_HANDLE); //stdin_handles[kReadHandle];
+    DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_INPUT_HANDLE), GetCurrentProcess(), &startup_info.hStdInput, NULL, TRUE, DUPLICATE_SAME_ACCESS);
+    DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_INPUT_HANDLE), GetCurrentProcess(), &hChildStdInput, NULL, FALSE, DUPLICATE_SAME_ACCESS);
+    //startup_info.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE); //stdout_handles[kWriteHandle];
+    DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_OUTPUT_HANDLE), GetCurrentProcess(), &startup_info.hStdOutput, NULL, TRUE, DUPLICATE_SAME_ACCESS);
+    //startup_info.hStdError = GetStdHandle(STD_ERROR_HANDLE); //stderr_handles[kWriteHandle];
+    DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE), GetCurrentProcess(), &startup_info.hStdError, NULL, TRUE, DUPLICATE_SAME_ACCESS);
+    printf("%d(%d) Duped stdinput: %d -> %d,%d, stdoutput: %d -> %d, stderr: %d -> %d\n", GetCurrentProcessId(), GetCurrentThreadId(), GetStdHandle(STD_INPUT_HANDLE), hChildStdInput, startup_info.hStdInput, GetStdHandle(STD_OUTPUT_HANDLE), startup_info.hStdOutput, GetStdHandle(STD_ERROR_HANDLE), startup_info.hStdError);
     startup_info.dwFlags = STARTF_USESTDHANDLES;
 
     PROCESS_INFORMATION process_info;
@@ -99,11 +225,29 @@ int _tmain(int argc, _TCHAR* argv[])
                                 &process_info);
     pss[i].hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     pss[i].pi = process_info;
-
-    PTP_WAIT myWait = CreateThreadpoolWait(callback, new WaiterParams(process_info, pss[i].hEvent, &pss[i].rc), &CallBackEnviron);
+    pss[i].hOutputRead = hOutputRead;
+    pss[i].hErrorRead = hErrorRead;
+    pss[i].hInputWrite = hInputWrite;
+    
+    PTP_WAIT myWait = CreateThreadpoolWait(callback, new WaiterParams(process_info, pss[i].hEvent, hChildStdInput, &pss[i].rc), &CallBackEnviron);
     SetThreadpoolWait(myWait, process_info.hProcess, NULL);
 
+    SubmitThreadpoolWork(CreateThreadpoolWork(redirectCallback, new PairOfHandles(hChildStdInput, hInputWrite, hInputWrite), &CallBackEnviron));
+    SubmitThreadpoolWork(CreateThreadpoolWork(redirectCallback, new PairOfHandles(hErrorRead, GetStdHandle(STD_ERROR_HANDLE), hErrorRead), &CallBackEnviron));
+    SubmitThreadpoolWork(CreateThreadpoolWork(redirectCallback, new PairOfHandles(hOutputRead, GetStdHandle(STD_OUTPUT_HANDLE), hOutputRead), &CallBackEnviron));
+
+    printf("%d(%d) Closing dups: stdin=%d stdout=%d stderr=%d\n", GetCurrentProcessId(), GetCurrentThreadId(), startup_info.hStdInput, startup_info.hStdOutput, startup_info.hStdError);
+    if (!CloseHandle(startup_info.hStdInput)) DisplayError("CloseHandle");
+    if (!CloseHandle(startup_info.hStdOutput)) DisplayError("CloseHandle");
+    if (!CloseHandle(startup_info.hStdError)) DisplayError("CloseHandle");
+
+    printf("%d(%d) Closing wrong ends: stdin=%d stdout=%d stderr=%d\n", GetCurrentProcessId(), GetCurrentThreadId(), hInputRead, hOutputWrite, hErrorWrite);
+    if (!CloseHandle(hInputRead)) DisplayError("CloseHandle");
+    if (!CloseHandle(hOutputWrite)) DisplayError("CloseHandle");
+    if (!CloseHandle(hErrorWrite)) DisplayError("CloseHandle");
+
     ResumeThread(process_info.hThread);
+
   }
 
   HANDLE* events = (HANDLE*)calloc(multiply, sizeof(HANDLE));
@@ -139,6 +283,9 @@ int _tmain(int argc, _TCHAR* argv[])
     CloseHandle(process_info->hProcess);
     CloseHandle(process_info->hThread);
 
+    //if (!CloseHandle(pss[i].hOutputRead)) DisplayError("CloseHandle");
+    //if (!CloseHandle(pss[i].hInputWrite)) DisplayError("CloseHandle");
+
 //    *wp->pRC = exit_code;
 //    exit_code = pss[i].rc;
     if (exit_code != 1) {
@@ -158,3 +305,30 @@ int _tmain(int argc, _TCHAR* argv[])
   return exit_code;
 }
 
+
+int _tmain(int argc, _TCHAR* argv[]) {
+  printf("%d(%d) Starting stdin=%d stdout=%d stderr=%d\n", GetCurrentProcessId(), GetCurrentThreadId(), GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE));
+  int rc = -1;
+  try {
+  //__try {
+  //  __try {
+      rc = _tmain1(argc, argv);
+  //  } __except(EXCEPTION_EXECUTE_HANDLER)
+  //  {
+  //    printf("EXCEPTION: %d\n", GetExceptionCode());
+  //    DebugBreak();
+  //  }
+  //} __finally {
+  //  if (rc != 1) {
+  //    DebugBreak();
+  //  }
+  //}
+  } catch(...) {
+    DebugBreak();
+  }
+  printf("%d(%d) Exiting and closing stdin=%d stdout=%d stderr=%d\n", GetCurrentProcessId(), GetCurrentThreadId(), GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE));
+  if (!CloseHandle(GetStdHandle(STD_INPUT_HANDLE))) { DisplayError("CloseHandle"); }
+  if (!CloseHandle(GetStdHandle(STD_OUTPUT_HANDLE))) { DisplayError("CloseHandle"); }
+  if (!CloseHandle(GetStdHandle(STD_ERROR_HANDLE))) { DisplayError("CloseHandle"); }
+  return rc;
+}
