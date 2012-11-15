@@ -329,7 +329,7 @@ int _tmain1(int argc, _TCHAR* argv[])
 }
 
 
-int _tmainfull(int argc, _TCHAR* argv[]) {
+int _tmain(int argc, _TCHAR* argv[]) {
   LoadLibrary(_T("testecdll.dll"));
  if (argc < 2) {
     Display("testec <depth> [<multiply>]\n");
